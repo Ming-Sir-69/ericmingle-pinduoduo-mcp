@@ -292,6 +292,7 @@ DETAIL_EXTRACT_JS = r"""(() => {
   const soldOut = /商品已售罄|已卖光/.test(text);
   const notFound = /商品已下架|商品不存在|该商品不存在/.test(text);
   return JSON.stringify({...status,ogTitle:meta('meta[property="og:title"]'),loginGated:false,
+    observed_goods_id:new URL(location.href).searchParams.getAll('goods_id').length===1?new URL(location.href).searchParams.get('goods_id'):null,
     name:name,name_status:name?'ok':'not_exposed',name_source:nameSource,
     price:price,price_status:price===null?'not_exposed':'ok',price_unit:'yuan',
     price_source:price===null?null:promotion?'visible_promotion_text':'visible_currency_text',
@@ -457,6 +458,7 @@ class LocalPinduoduoAdapter:
         self.data_dir = Path(os.environ.get("MCP_DATA_DIR", os.environ.get("PDD_DATA_DIR", str(self.root / "runtime"))))
         self.watchlist = watchlist_module.Watchlist("pinduoduo", canonical_product_url, self.data_dir)
         self.notifications = notifications_module.Notifications(self.watchlist, self.product)
+        self.pending_cart = pending_cart_module.PendingCart(self.watchlist, self.product, canonical_product_url)
         self._risk_file = self.data_dir / "risk-lock.json"
         self.__risk_blocked = self._risk_file.exists()
         self._clock = clock if clock is not None else time.monotonic
@@ -491,7 +493,7 @@ class LocalPinduoduoAdapter:
             "session": SESSION, "group_title": GROUP_TITLE, "profile_path": "existing-brave-profile",
             "browser_running": running, "login_verified": False, "login_hint": False,
             "risk_control_detected": self._risk_blocked,
-            "capabilities": {"cart": "unsupported", "favorite": "implemented_unverified", "detail": "implemented", "search": "implemented", "merchant_send": "implemented_unverified", "merchant_messages": "implemented_unverified"},
+            "capabilities": {"cart": "unsupported", "pending_cart": "mcp_managed_local", "favorite": "implemented_unverified", "detail": "implemented", "search": "implemented", "merchant_send": "implemented_unverified", "merchant_messages": "implemented_unverified"},
         }
 
     def _error(self, code: str) -> dict[str, Any]:
@@ -654,7 +656,15 @@ class LocalPinduoduoAdapter:
             return {"_issue": "unexpected_redirect"}
         if "login" in urlsplit(snapshot["url"]).path.lower():
             return {"_issue": "login_required"}
+        if extractor==DETAIL_EXTRACT_JS:
+            try:
+                if validate_product_input(snapshot['url'])!=validate_product_input(url):
+                    return {'_issue':'unexpected_redirect'}
+            except ValueError:
+                return {'_issue':'unexpected_redirect'}
         raw = decode_evaluation(await self.bridge.command("evaluate", {"code": extractor}))
+        if extractor==DETAIL_EXTRACT_JS and raw.get('observed_goods_id',validate_product_input(url))!=validate_product_input(url):
+            return {'_issue':'unexpected_redirect'}
         issue = self._page_issue(raw, str(raw.get("url", "")))
         raw["_reused_current_page"] = reused
         return {"_issue": issue} if issue else raw
@@ -979,6 +989,9 @@ watchlist_spec.loader.exec_module(watchlist_module)
 notifications_spec = importlib.util.spec_from_file_location("pdd_notifications", WORKSPACE_ROOT / "src/notifications.py")
 notifications_module = importlib.util.module_from_spec(notifications_spec)
 notifications_spec.loader.exec_module(notifications_module)
+pending_cart_spec = importlib.util.spec_from_file_location("pdd_pending_cart", WORKSPACE_ROOT / "src/pending_cart.py")
+pending_cart_module = importlib.util.module_from_spec(pending_cart_spec)
+pending_cart_spec.loader.exec_module(pending_cart_module)
 adapter = LocalPinduoduoAdapter()
 mcp = FastMCP(
     "pinduoduo-personal", host=MCP_HOST, port=MCP_PORT,
@@ -989,6 +1002,7 @@ mcp = FastMCP(
 
 watchlist_module.register_watchlist(mcp, adapter.watchlist)
 notifications_module.register_notifications(mcp, adapter.notifications)
+pending_cart_module.register_pending_cart(mcp, adapter.pending_cart)
 
 
 @mcp.tool()
