@@ -133,7 +133,7 @@ async def test_bridge_does_not_echo_error_messages_or_accept_credential_commands
 async def test_mcp_preserves_existing_tools_and_adds_native_favorite_pair():
     tools = await adapter_module().mcp.list_tools()
     by_name = {tool.name: tool.inputSchema.get("properties", {}) for tool in tools}
-    assert set(by_name) == {"login_pinduoduo", "status_pinduoduo", "search_pinduoduo", "get_pinduoduo_product", "close_pinduoduo_browser", "favorite_pinduoduo_item", "unfavorite_pinduoduo_item", "watchlist_upsert", "watchlist_list", "watchlist_check"}
+    assert set(by_name) == {"login_pinduoduo", "status_pinduoduo", "search_pinduoduo", "get_pinduoduo_product", "close_pinduoduo_browser", "favorite_pinduoduo_item", "unfavorite_pinduoduo_item", "watchlist_upsert", "watchlist_list", "watchlist_check", "contact_merchant", "merchant_messages", "notification_configure", "notification_status", "notify_owner"}
     assert set(by_name["search_pinduoduo"]) == {"keyword", "limit"}
     assert set(by_name["get_pinduoduo_product"]) == {"url_or_id"}
     assert not by_name["login_pinduoduo"] and not by_name["status_pinduoduo"]

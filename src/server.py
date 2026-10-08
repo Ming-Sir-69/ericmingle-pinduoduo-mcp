@@ -11,6 +11,7 @@ import argparse
 import ast
 import asyncio
 import copy
+import hashlib
 import json
 import importlib.util
 import math
@@ -356,6 +357,14 @@ def is_favorite_script(code: Any) -> bool:
 
 FIXED_EVALUATIONS = {STATUS_JS, SEARCH_EXTRACT_JS, DETAIL_EXTRACT_JS}
 
+merchant_spec = importlib.util.spec_from_file_location("pdd_merchant_dom", WORKSPACE_ROOT / "src/merchant_dom.py")
+merchant_module = importlib.util.module_from_spec(merchant_spec)
+merchant_spec.loader.exec_module(merchant_module)
+
+
+def merchant_script(goods_id: str, phase="entry", text="", click=False, mall_sn="") -> str:
+    return merchant_module.build_script(goods_id, STATUS_JS, phase, text, click, mall_sn)
+
 
 def redact_text(value: Any, limit: int = 200) -> str:
     text = str(value or "")[:limit]
@@ -403,7 +412,7 @@ class BridgeClient:
             return
         if action == "network" and args == {"cmd": "list"}:
             return
-        if action == "evaluate" and set(args) == {"code"} and (args["code"] in FIXED_EVALUATIONS or is_favorite_script(args["code"])):
+        if action == "evaluate" and set(args) == {"code"} and (args["code"] in FIXED_EVALUATIONS or is_favorite_script(args["code"]) or merchant_module.matches_script(args["code"], STATUS_JS)):
             return
         if action == "find_tab" and set(args) == {"url", "active"} and args["active"] is False and _is_official_url(args["url"]):
             return
@@ -447,6 +456,7 @@ class LocalPinduoduoAdapter:
         self._lock = asyncio.Lock()
         self.data_dir = Path(os.environ.get("MCP_DATA_DIR", os.environ.get("PDD_DATA_DIR", str(self.root / "runtime"))))
         self.watchlist = watchlist_module.Watchlist("pinduoduo", canonical_product_url, self.data_dir)
+        self.notifications = notifications_module.Notifications(self.watchlist, self.product)
         self._risk_file = self.data_dir / "risk-lock.json"
         self.__risk_blocked = self._risk_file.exists()
         self._clock = clock if clock is not None else time.monotonic
@@ -481,7 +491,7 @@ class LocalPinduoduoAdapter:
             "session": SESSION, "group_title": GROUP_TITLE, "profile_path": "existing-brave-profile",
             "browser_running": running, "login_verified": False, "login_hint": False,
             "risk_control_detected": self._risk_blocked,
-            "capabilities": {"cart": "unsupported", "favorite": "implemented_unverified", "detail": "implemented", "search": "implemented"},
+            "capabilities": {"cart": "unsupported", "favorite": "implemented_unverified", "detail": "implemented", "search": "implemented", "merchant_send": "implemented_unverified", "merchant_messages": "implemented_unverified"},
         }
 
     def _error(self, code: str) -> dict[str, Any]:
@@ -773,6 +783,115 @@ class LocalPinduoduoAdapter:
         return tool_result({"platform": "pinduoduo", "state": "error", "code": "unsupported", "goodsId": goods_id,
                        "reason": "当前拼多多网页购物流程未提供已核实的原生购物车；不会用收藏或本地清单代替加购。"}, {"cart": "unsupported"})
 
+    async def contact_merchant(self, url: str, text: str):
+        """Validate a specific merchant request; currently no verified send DOM."""
+        if (not isinstance(text, str) or not 1 <= len(text.strip()) <= 500
+                or len(text) > 500 or any(ord(char) < 32 and char not in "\n\t" for char in text)):
+            return self._error("invalid_input")
+        return await self._merchant_inspect(url, text)
+
+    async def merchant_messages(self, url: str):
+        return await self._merchant_inspect(url)
+
+    async def _merchant_inspect(self, url: str, text=None):
+        try:
+            # Merchant authorization names a URL, never an implicit current page or numeric ID.
+            if not isinstance(url, str) or not _is_official_url(url):
+                raise ValueError()
+            goods_id = validate_product_input(url)
+        except ValueError:
+            return self._error("invalid_input")
+        canonical = canonical_product_url(url)
+        async with self._lock:
+            if self._risk_blocked:
+                return self._error("risk_control")
+            cooldown = self._navigation_cooldown()
+            if cooldown:
+                return cooldown
+            event_id = hashlib.sha256((canonical+'|'+text).encode()).hexdigest() if text else None
+            with self.watchlist.connect() as db:
+                db.execute('CREATE TABLE IF NOT EXISTS merchant_bindings(goods_id TEXT PRIMARY KEY,mall_sn TEXT)')
+                bound=db.execute('SELECT mall_sn FROM merchant_bindings WHERE goods_id=?',(goods_id,)).fetchone()
+            expected_mall = bound[0] if bound else ''
+            if event_id:
+                with self.watchlist.connect() as db:
+                    db.execute('CREATE TABLE IF NOT EXISTS merchant_sends(id TEXT PRIMARY KEY,state TEXT)')
+                    old=db.execute('SELECT state FROM merchant_sends WHERE id=?',(event_id,)).fetchone()
+                if old:
+                    return {"ok":old[0]=='verified',"status":"ok" if old[0]=='verified' else "unverified","data":{"already":True,"sent":True if old[0]=='verified' else None},"already":True,"sent":True if old[0]=='verified' else None}
+            try:
+                tab = await self._task_tab()
+                if tab:
+                    _, issue = await self._observe(tab)
+                    if issue:
+                        return self._error(issue)
+                reuse = False
+                if tab:
+                    try:
+                        current_url=tab.get("url", "")
+                        parsed=urlsplit(current_url)
+                        values=parse_qs(parsed.query)
+                        reuse = _is_official_url(current_url) and (validate_product_input(current_url)==goods_id if parsed.path!='/chat_detail.html' else bool(expected_mall) and values.get('goods_id')==[goods_id] and values.get('mall_sn')==[expected_mall])
+                    except ValueError:
+                        pass
+                if not reuse:
+                    await self._navigate(canonical)
+                    tab = await self._task_tab()
+                if not tab:
+                    return self._error("unexpected_redirect")
+                async def inspect(phase, click=False):
+                    current=await self._task_tab()
+                    if not current: raise BridgeError('unexpected_redirect')
+                    current_path=urlsplit(str(current.get('url',''))).path.lower()
+                    if re.search(r'checkout|order|payment|cashier|pay\.html',current_path): raise BridgeError('checkout_page_reached')
+                    if phase=='entry':
+                        if validate_product_input(current.get('url',''))!=goods_id: raise BridgeError('unexpected_redirect')
+                    else:
+                        values=parse_qs(urlsplit(str(current.get('url',''))).query,keep_blank_values=True)
+                        if current_path!='/chat_detail.html' or values.get('goods_id')!=[goods_id] or not expected_mall or values.get('mall_sn')!=[expected_mall]: raise BridgeError('unexpected_redirect')
+                    await self._select_task_tab(current)
+                    raw=decode_evaluation(await self.bridge.command('evaluate',{'code':merchant_script(goods_id,phase,(text or '') if phase in {'draft','send'} else '',click,expected_mall if phase!='entry' else '')}))
+                    issue=self._page_issue(raw,str(raw.get('url',''))) or raw.get('issue')
+                    if issue: raise BridgeError(issue if issue in ERROR_MESSAGES else 'parse_error')
+                    if raw.get('goodsId')!=goods_id: raise BridgeError('unexpected_redirect')
+                    return raw
+                if urlsplit(tab['url']).path!='/chat_detail.html':
+                    await inspect('entry')
+                    await inspect('entry',click=True)
+                    await asyncio.sleep(0.3)
+                    arrived=await self._task_tab()
+                    values=parse_qs(urlsplit(str(arrived.get('url','')) if arrived else '').query,keep_blank_values=True)
+                    if values.get('goods_id')!=[goods_id] or len(values.get('mall_sn',[]))!=1 or not values['mall_sn'][0] or len(values['mall_sn'][0])>512:
+                        return self._error('unexpected_redirect')
+                    expected_mall=values['mall_sn'][0]
+                    with self.watchlist.connect() as db:
+                        db.execute('INSERT OR REPLACE INTO merchant_bindings VALUES(?,?)',(goods_id,expected_mall))
+                before=await inspect('read')
+                messages=[{'text':redact_text(m.get('text',''),1000)} for m in before.get('messages',[]) if isinstance(m,dict)]
+                if text is None:
+                    return tool_result({'platform':'pinduoduo','goodsId':goods_id,'url':canonical,'messages':messages,'merchant_identity_verified':True,'state':'ok'})
+                with self.watchlist.connect() as db:
+                    db.execute('INSERT INTO merchant_sends VALUES(?,?)',(event_id,'unknown'))
+                try:
+                    await inspect('draft')
+                    await asyncio.sleep(0.1)
+                    clicked=await inspect('send')
+                    await asyncio.sleep(0.3)
+                    after=await inspect('read')
+                    confirmed=clicked.get('clicked') is True and after.get('message_count',0)>before.get('message_count',0) and bool(after.get('messages')) and text in after['messages'][-1].get('text','')
+                except BridgeError as exc:
+                    if exc.code in {'risk_control','login_required','unexpected_redirect','checkout_page_reached'}: raise
+                    confirmed=False
+                if confirmed:
+                    with self.watchlist.connect() as db: db.execute('UPDATE merchant_sends SET state=? WHERE id=?',('verified',event_id))
+                return {'ok':confirmed,'status':'ok' if confirmed else 'unverified','data':{'goodsId':goods_id,'sent':True if confirmed else None,'automatic_retry':False},'goodsId':goods_id,'sent':True if confirmed else None,'automatic_retry':False,'draft_may_remain':not confirmed}
+            except BridgeError as exc:
+                return self._error(exc.code)
+            except ValueError:
+                return self._error("unexpected_redirect")
+            except Exception:
+                return self._error("bridge_error")
+
     async def favorite(self, url_or_id: str, wanted: bool = True):
         try:
             goods_id = validate_product_input(url_or_id)
@@ -846,6 +965,7 @@ class LocalPinduoduoAdapter:
 
     async def shutdown(self):
         # The task's HTTP client is ours; the user's Brave and tabs are not.
+        await self.notifications.close()
         await self.bridge.aclose()
 
 
@@ -856,6 +976,9 @@ def canonical_product_url(value: str) -> str:
 watchlist_spec = importlib.util.spec_from_file_location("pdd_local_watchlist", WORKSPACE_ROOT / "src/watchlist.py")
 watchlist_module = importlib.util.module_from_spec(watchlist_spec)
 watchlist_spec.loader.exec_module(watchlist_module)
+notifications_spec = importlib.util.spec_from_file_location("pdd_notifications", WORKSPACE_ROOT / "src/notifications.py")
+notifications_module = importlib.util.module_from_spec(notifications_spec)
+notifications_spec.loader.exec_module(notifications_module)
 adapter = LocalPinduoduoAdapter()
 mcp = FastMCP(
     "pinduoduo-personal", host=MCP_HOST, port=MCP_PORT,
@@ -865,6 +988,7 @@ mcp = FastMCP(
 
 
 watchlist_module.register_watchlist(mcp, adapter.watchlist)
+notifications_module.register_notifications(mcp, adapter.notifications)
 
 
 @mcp.tool()
@@ -909,6 +1033,18 @@ async def close_pinduoduo_browser() -> dict[str, Any]:
     return await adapter.close()
 
 
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True})
+async def contact_merchant(url: str, text: str) -> dict[str, Any]:
+    """显式官方商品 URL + 1–500 字正文；由原生客服进入匹配商品会话，唯一发送一次后读回。同正文持久去重，未知不重发；真实发送尚未验收。"""
+    return await adapter.contact_merchant(url, text)
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
+async def merchant_messages(url: str) -> dict[str, Any]:
+    """打开指定商品的官方客服会话，核对goods_id/mall_sn，读取最多20条消息容器项；不输入、不发送。"""
+    return await adapter.merchant_messages(url)
+
+
 def create_http_app():
     app = mcp.streamable_http_app()
     original_lifespan = app.router.lifespan_context
@@ -917,6 +1053,7 @@ def create_http_app():
     async def process_lifespan(application):
         try:
             async with original_lifespan(application) as state:
+                adapter.notifications.start()
                 yield state
         finally:
             await adapter.shutdown()
@@ -931,6 +1068,7 @@ def create_http_app():
 async def run_server(stdio: bool = False):
     if stdio:
         try:
+            adapter.notifications.start()
             await mcp.run_stdio_async()
         finally:
             await adapter.shutdown()

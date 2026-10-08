@@ -1,0 +1,57 @@
+{
+  "captured_utc": "2026-10-08T06:59:28.632004+00:00",
+  "scope": "read-only limited DOM attrs on current detail page; no navigation, no click, no cookies",
+  "source": "Claude read-only detail-page DOM evidence, round 2",
+  "observed": {
+    "host": "mobile.yangkeduo.com",
+    "path": "/goods2.html",
+    "risk": false,
+    "controls": [
+      {
+        "tag": "DIV",
+        "id": "",
+        "cls": "fdAX50IM",
+        "own_text": "",
+        "href": "",
+        "parent": "DIV.BFIane9M"
+      },
+      {
+        "tag": "SPAN",
+        "id": "",
+        "cls": "",
+        "own_text": "进店逛逛",
+        "href": "",
+        "parent": "DIV.t3cPASuX"
+      },
+      {
+        "tag": "SPAN",
+        "id": "",
+        "cls": "",
+        "own_text": "客服",
+        "href": "",
+        "parent": "DIV.Lng9KDck"
+      }
+    ],
+    "sku": [],
+    "qty": []
+  },
+  "cart": {
+    "status": "unsupported",
+    "reason": "No add-to-cart control in the observed ordinary web detail page; group-buy is not a cart."
+  },
+  "merchant": {
+    "entry_selector": "div.Lng9KDck > span",
+    "entry_text": "客服",
+    "href": null,
+    "conversation_observed": true,
+    "identity_verified": false,
+    "send_supported": true,
+    "messages_supported": true,
+    "identity_verified_by": "native product contact navigation; exact goods_id + unique nonempty mall_sn",
+    "send_selector": "div.chat-input-provider > div.text-container > div.send-button",
+    "input_selector": "textarea.input-content",
+    "messages_container": "div.list-container.chat-msg-provider",
+    "live_send_verified": false,
+    "reversible_draft_probe_cleared": true
+  }
+}
