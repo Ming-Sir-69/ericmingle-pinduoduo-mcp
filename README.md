@@ -10,19 +10,23 @@
 
 ## 能力与当前边界
 
-本机真实验收：空待购车→当场读取真实商品页后入车→查询1条→删除→查询0条；恢复原状，末次状态无风控。标题/规格/库存未暴露时保留unknown。
+首版共21个工具。真实检查已通过：搜索与limit、官方聊天首页会话概览、本MCP待购车增查删恢复、本人邮件送达。商品详情有早前真实读取证据；后来网页详情出现“前往APP查看价格”、底栏收藏/客服缺失。收藏及指定商品商家消息因此按实验能力交付，修复后未完成真实工具复验，不继续反复访问降级详情页。
 
-每个MCP独立，只处理本平台；跨平台比价由调用智能体负责。
+`search_pinduoduo(keyword, limit=5, sort="default", page=1)`的limit为1–10；`page_scope=loaded_only`只对本次已加载结果按本次limit切片，不是平台网页翻页。超出该批结果返回unsupported及outside_loaded_results；loaded_count/has_next_page不代表全站结果。price_asc/price_desc只排序本页展示价，标sort_scope=page_local。
 
-提供 pending_cart_add/list/remove：这是本MCP管理的待购车，不同步平台购物车。入车先当场读取真实商品页，持久保存商品/可见规格/数量；数量为设定值，重复相同请求不叠加。展示价非结算价，未暴露的标题、规格、库存明确unknown。
+`favorite_pinduoduo_item`/`unfavorite_pinduoduo_item`的原生动作与“已收藏/收藏”两态已有真实页面证据；已修复精确原生/React控件识别、祖孙去重及单次点击后的短只读确认。App降级页返回unsupported及有限证据。修复后的完整工具往返和记录联动尚未复验。
 
-商家交流提供 merchant_messages/contact_merchant，先核对商品对应店铺与会话，单次发送后读回，已有草稿不覆盖；三站未向真实商家发送测试消息，实发仍未验收。本人完成认证、最终下单支付。
+`favorite_list(page=1)`是**本MCP确认收藏记录**：仅页面状态真实确认后才写入或移除，source=mcp_confirmed_actions、platform_full_list=false，每页20条；不含App历史收藏，不宣称平台全量同步。原生收藏列表入口本次观察为App提示；未有真实确认记录时保留该边界。该记录与watchlist分表，不能混称。
 
-通知只发本人邮件，没有桌面弹窗分支或桌面兜底。把 notification-mail.example.json 复制到私人数据目录的 notification-mail.json，填写已有邮件MCP地址、本人发件/收件身份及必要headers；也可用MCP_MAIL_CONFIG指定私有文件。不要提交真实配置。notify_owner用于智能体确认交易条件后的邮件提醒；accepted是邮件工具报告发送，送达须收件箱读回。未知投递不盲重发。本人邮件链路已完成收件箱正文与本人确认验收。
+`watchlist_upsert/list/check/remove`为独立本地分类清单、目标价及报价缓存。remove幂等删除指定商品的清单、报价和通知刷新记录，不操作平台收藏、本MCP确认收藏记录或待购车。check只看近期缓存报价，不自行联网刷新。
 
-notification_configure后台目标价监测默认关闭，每件至少30分钟刷新；同商品同目标只提醒一次，风险/认证即暂停。自动价格触发目前有离线测试，尚未长期运行或真实条件触发验收。本地分类清单与平台收藏/购物车分别存在。
+`conversation_list()`真实读回5个可见会话的概览，对象名、时间、末条摘要未露出时保留null；交流仍用调用者提供的明确商品URL。`merchant_messages/contact_merchant`已有原生客服入口和匹配商品会话可读的页面证据，已修复容器尚未渲染的时序；修复后受详情App降级影响未复验。contact_merchant单次发送后读回、已有草稿不覆盖；**本轮未实际向商家发送消息，实发仍未验收。**
 
-已移除写动作中的网页长计时轮询，使用短动作+Python侧限时只读确认；真实站点样例成功不等于全部商品/长期免风控。当前仍依赖既有日常浏览器和WebBridge，本轮未迁NAS。
+`pending_cart_add/list/remove`是本MCP管理的待购车，不同步平台购物车。入车当场读真实详情后持久保存商品、可见规格与期望数量，重复相同请求不累加。真实入车→查询1条→删除→查询0条已恢复原状；展示价非结算价，未暴露标题/规格/库存保留unknown。平台下单、支付由本人完成。
+
+`notify_owner/notification_configure/notification_status`只发本人邮件，无桌面弹窗或兜底。将notification-mail.example.json复制到私人数据目录并填写已有邮件MCP配置，或用MCP_MAIL_CONFIG指定私人文件；真实配置不要提交。accepted仅表示邮件工具报告发送，送达须收件箱读回。本人邮件链路已确认送达；未知投递不盲重发。后台目标价监测默认关闭、每商品至少30分钟刷新，风险/认证即暂停；自动价格触发只做离线合同检查，未宣称长期运行验收。
+
+另提供login_pinduoduo、status_pinduoduo、get_pinduoduo_product及close_pinduoduo_browser；只操作固定任务页、保留日常浏览器会话，由本人认证。未提供图片消息、文件上传、卖家发布或上下架。跨平台比价由调用智能体组合各独立MCP结果。当前仍依赖日常浏览器/WebBridge，未迁NAS。
 
 ## Docker / NAS
 
@@ -35,3 +39,5 @@ notification_configure后台目标价监测默认关闭，每件至少30分钟�
 ## 致谢
 
 [上游 goesByhc/cn-scraper-mcp](https://github.com/goesByhc/cn-scraper-mcp) 的解析与实践提供基础，原版权与 MIT 文本完整保留。EricMingle 为个人维护标识，不代表平台官方服务。
+
+买方功能划分与回执机制参考 [DoLovya/xianyu-mcp-server](https://github.com/DoLovya/xianyu-mcp-server)。感谢其闲鱼买方流程；本项目未复制该项目的GPL源码，拼多多页面适配独立实现。

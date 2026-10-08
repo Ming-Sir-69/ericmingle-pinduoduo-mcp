@@ -33,7 +33,8 @@ ENTRY_JS = r"""(() => {
        actual.pathname!=='/chat_detail.html' || actual.searchParams.getAll('goods_id').length!==1 || actual.searchParams.get('goods_id')!==args.goods_id ||
        actual.searchParams.getAll('mall_sn').length!==1 || !args.mall_sn || actual.searchParams.get('mall_sn')!==args.mall_sn) return JSON.stringify({...base,issue:'unexpected_redirect'});
     const containers=[...document.querySelectorAll('div.list-container.chat-msg-provider')].filter(visible);
-    if(containers.length!==1) return JSON.stringify({...base,issue:'ambiguous_control'});
+    if(containers.length!==1) return JSON.stringify({...base,goodsId:args.goods_id,
+      issue:'ambiguous_control',conversation_loading:containers.length===0});
     const rows=[...containers[0].children].map(el=>(el.textContent||'').trim()).filter(Boolean);
     const messages=rows.slice(-20).map(text=>({text:text.slice(0,1000)}));
     const result={...base,goodsId:args.goods_id,merchant_identity_verified:true,messages,message_count:rows.length};

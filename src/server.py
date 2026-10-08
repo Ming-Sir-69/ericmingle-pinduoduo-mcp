@@ -185,6 +185,7 @@ STATUS_JS = r"""(() => {
     loginRequired: authInputPresent || loginOverlayPresent || /login/.test(path) || /请先登录|登录后查看|手机号登录|请输入验证码/.test(text),
     riskControl: /系统繁忙|网络异常|安全验证|请完成验证|异常访问|访问过于频繁|访问频繁|滑块验证/.test(text) || /captcha|verify|risk/.test(path),
     notSupported: /仅支持手机|请使用手机浏览器|不支持当前浏览器|请在手机端打开|暂不支持电脑|请使用拼多多APP访问/.test(text),
+    appRequired: /前往APP查看价格/i.test(text),
     smsSendFailed: /发送失败/.test(text)
   });
 })()"""
@@ -306,6 +307,7 @@ FAVORITE_JS = r"""(() => {
   const status = JSON.parse(__STATUS_SCRIPT__);
   const base = {url:location.origin+location.pathname, ...status};
   if (status.loginRequired || status.riskControl || status.notSupported) return JSON.stringify(base);
+  if (status.appRequired) return JSON.stringify({...base,issue:'unsupported',evidence:{app_prompt:'前往APP查看价格'}});
   const actual = new URL(location.href);
   if (actual.protocol !== 'https:' || actual.hostname !== 'mobile.yangkeduo.com' ||
       actual.username || actual.password || actual.port && actual.port!=='443' ||
@@ -317,9 +319,42 @@ FAVORITE_JS = r"""(() => {
     const css = window.getComputedStyle(el);
     return css.display!=='none' && css.visibility!=='hidden' && css.visibility!=='collapse';
   };
-  const label = el => (el.getAttribute('aria-label') || el.textContent || '').trim();
+  const exact = value => /^(收藏|收藏商品|已收藏|取消收藏)$/.test(value);
+  const label = el => {
+    const text = (el.textContent || '').trim();
+    return exact(text) ? text : (el.getAttribute('aria-label') || '').trim();
+  };
   const scope = document;
-  const buttons = [...scope.querySelectorAll('button, a, [role="button"], [aria-label]')].filter(el=>visible(el) && /^(收藏|收藏商品|已收藏|取消收藏)$/.test(label(el)));
+  const standard = new Set(scope.querySelectorAll('button, a, [role="button"], [aria-label]'));
+  const reactClick = el => Object.keys(el).filter(key=>key.startsWith('__reactProps$')).some(key=>{
+    const descriptor = Object.getOwnPropertyDescriptor(el,key);
+    const props = descriptor && descriptor.value;
+    const handler = props && Object.getOwnPropertyDescriptor(props,'onClick');
+    return handler && typeof handler.value === 'function';
+  });
+  const transient = el => {
+    for (let node=el; node; node=node.parentElement) {
+      if (node.getAttribute('aria-live') || /^(alert|status)$/.test(node.getAttribute('role') || '') ||
+          /(?:^|[\s_-])(?:toast|snackbar)(?:$|[\s_-])/i.test(node.getAttribute('class') || '')) return true;
+    }
+    return false;
+  };
+  const grouped = new Map();
+  const nativeButton = el => el.matches ? el.matches('button, a, [role="button"]') : standard.has(el);
+  for (const el of new Set([...standard,...scope.querySelectorAll('div, span')])) {
+    if (!visible(el) || !exact(label(el)) || transient(el)) continue;
+    let target=null;
+    for (let node=el, depth=0; node && depth<3; node=node.parentElement,depth++) {
+      if (nativeButton(node) || reactClick(node)) {target=node;break;}
+    }
+    if (target && visible(target) && !transient(target)) grouped.set(target,el);
+  }
+  const keys = [...grouped.keys()];
+  const buttons = keys.filter(el => !keys.some(other => {
+    if (other===el) return false;
+    for (let parent=el.parentElement; parent; parent=parent.parentElement) if (parent===other) return true;
+    return false;
+  }));
   if (buttons.length!==1) return JSON.stringify({...base,issue:buttons.length>1?'ambiguous_control':'unsupported'});
   const target = buttons[0];
   const forbidden = /立即购买|购买|结算|提交订单|付款|支付|领券购买|checkout|buy|confirm_order|order/i;
@@ -329,9 +364,10 @@ FAVORITE_JS = r"""(() => {
     if (forbidden.test(ownText+' '+(node.getAttribute('href')||'')+' '+(node.getAttribute('action')||'')+' '+(node.getAttribute('aria-label')||'')))
       return JSON.stringify({...base,issue:'unsafe_control'});
   }
+  const stateLabel = label(grouped.get(target));
   const pressed = target.getAttribute('aria-pressed');
-  const current = pressed==='true' || /^(已收藏|取消收藏)$/.test(label(target)) ? true : pressed==='false' || /^(收藏|收藏商品)$/.test(label(target)) ? false : null;
-  if (current===null || pressed==='true' && /^(收藏|收藏商品)$/.test(label(target)) || pressed==='false' && /^(已收藏|取消收藏)$/.test(label(target)))
+  const current = pressed==='true' || /^(已收藏|取消收藏)$/.test(stateLabel) ? true : pressed==='false' || /^(收藏|收藏商品)$/.test(stateLabel) ? false : null;
+  if (current===null || pressed==='true' && /^(收藏|收藏商品)$/.test(stateLabel) || pressed==='false' && /^(已收藏|取消收藏)$/.test(stateLabel))
     return JSON.stringify({...base,issue:'ambiguous_control'});
   if (current === args.wanted) return JSON.stringify({...base,confirmed:true,favorited:current,changed:false});
   if (!args.click) return JSON.stringify({...base,confirmed:false,favorited:current,can_click:true});
@@ -356,7 +392,41 @@ def is_favorite_script(code: Any) -> bool:
     return code == favorite_script(args["goods_id"], args["wanted"], args["click"])
 
 
-FIXED_EVALUATIONS = {STATUS_JS, SEARCH_EXTRACT_JS, DETAIL_EXTRACT_JS}
+CONVERSATION_LIST_JS = r"""(() => {
+  const status = JSON.parse(__STATUS_SCRIPT__);
+  const base = {...status, conversations: [], empty: false};
+  if (status.loginRequired || status.riskControl || status.notSupported) return JSON.stringify(base);
+  if (location.pathname !== '/chat_list.html') return JSON.stringify({...base, issue:'unexpected_redirect'});
+  const visible = el => el.getClientRects().length && window.getComputedStyle(el).visibility !== 'hidden';
+  const timePattern = /^(?:\d{1,2}:\d{2}|\d{2,4}[\/-]\d{1,2}[\/-]\d{1,2}|昨天|今天|前天|星期[一二三四五六日天])(?:\s+\d{1,2}:\d{2})?$/;
+  for (const row of [...document.querySelectorAll('.msg-box')].filter(visible).slice(0, 50)) {
+    const detail = row.querySelector('.msg-detail') || row.querySelector('.detail-box') || row;
+    const lines = (detail.innerText || '').split('\n').map(x=>x.trim()).filter(Boolean);
+    const time = lines.find(x=>timePattern.test(x)) || null;
+    const content = lines.filter(x=>x !== time && !/^\d+$/.test(x));
+    if (!content.length) continue;
+    const unreadEl = row.querySelector('.unread, .unread-count, .badge');
+    const unreadText = unreadEl && (unreadEl.innerText || '').trim();
+    let goodsId = row.getAttribute('data-goods-id');
+    if (!/^[0-9]{1,20}$/.test(goodsId || '')) goodsId = null;
+    for (const link of row.querySelectorAll('a[href]')) {
+      try {
+        const url = new URL(link.getAttribute('href'), location.origin);
+        if (url.origin !== location.origin || !['/goods.html','/goods2.html','/chat_detail.html'].includes(url.pathname)) continue;
+        const ids = url.searchParams.getAll('goods_id');
+        if (ids.length === 1 && /^[0-9]{1,20}$/.test(ids[0])) {goodsId=ids[0];break;}
+      } catch (_) {}
+    }
+    base.conversations.push({name:content[0].slice(0,200), last_time:time,
+      last_message:content.length > 1 ? content[content.length - 1].slice(0,160) : null,
+      unread:unreadText && /^\d+$/.test(unreadText) ? Number(unreadText) : null,
+      goodsId:goodsId, source:'visible_msg_box'});
+  }
+  base.empty = !base.conversations.length && /暂无消息|暂无聊天|还没有消息|暂无会话/.test(document.body.innerText || '');
+  return JSON.stringify(base);
+})()""".replace('__STATUS_SCRIPT__', STATUS_JS)
+
+FIXED_EVALUATIONS = {STATUS_JS, SEARCH_EXTRACT_JS, DETAIL_EXTRACT_JS, CONVERSATION_LIST_JS}
 
 merchant_spec = importlib.util.spec_from_file_location("pdd_merchant_dom", WORKSPACE_ROOT / "src/merchant_dom.py")
 merchant_module = importlib.util.module_from_spec(merchant_spec)
@@ -413,13 +483,15 @@ class BridgeClient:
             return
         if action == "network" and args == {"cmd": "list"}:
             return
+        if action == 'cdp' and args == {'method':'Page.bringToFront','params':{}}:
+            return
         if action == "evaluate" and set(args) == {"code"} and (args["code"] in FIXED_EVALUATIONS or is_favorite_script(args["code"]) or merchant_module.matches_script(args["code"], STATUS_JS)):
             return
         if action == "find_tab" and set(args) == {"url", "active"} and args["active"] is False and _is_official_url(args["url"]):
             return
         if action == "navigate" and set(args) == {"url", "newTab", "group_title"}:
             if (_is_official_url(args["url"]) and isinstance(args["newTab"], bool)
-                    and args["group_title"] == GROUP_TITLE and urlsplit(args["url"]).path in {"/login.html", "/search_result.html", "/goods2.html", "/goods.html"}):
+                    and args["group_title"] == GROUP_TITLE and urlsplit(args["url"]).path in {"/login.html", "/search_result.html", "/goods2.html", "/goods.html", "/chat_list.html"}):
                 return
         raise ValueError("Bridge command is outside the fixed personal-shopping task contract")
 
@@ -493,11 +565,19 @@ class LocalPinduoduoAdapter:
             "session": SESSION, "group_title": GROUP_TITLE, "profile_path": "existing-brave-profile",
             "browser_running": running, "login_verified": False, "login_hint": False,
             "risk_control_detected": self._risk_blocked,
-            "capabilities": {"cart": "unsupported", "pending_cart": "mcp_managed_local", "favorite": "implemented_unverified", "detail": "implemented", "search": "implemented", "merchant_send": "implemented_unverified", "merchant_messages": "implemented_unverified"},
+            "capabilities": {"cart": "unsupported", "pending_cart": "mcp_managed_local", "favorite": "implemented_unverified", "favorite_list": "unsupported_app_required", "conversation_list": "implemented_unverified", "detail": "implemented", "search": "implemented", "merchant_send": "implemented_unverified", "merchant_messages": "implemented_unverified"},
         }
 
     def _error(self, code: str) -> dict[str, Any]:
         return tool_result({**self._base_status(), "state": "error", "code": code, "error": ERROR_MESSAGES[code]})
+
+    def _app_favorite_unsupported(self):
+        output = self._error('unsupported')
+        output['status'] = 'unsupported'
+        evidence = {'app_prompt':'前往APP查看价格','scope':'observed_product_page'}
+        output['evidence'] = evidence
+        output['data']['evidence'] = evidence
+        return output
 
     async def _task_tab(self):
         data = await self.bridge.command("list_tabs")
@@ -530,6 +610,12 @@ class LocalPinduoduoAdapter:
             raise BridgeError()
         if not _is_official_url(str(data.get("url", ""))):
             raise BridgeError("unexpected_redirect")
+
+    async def _front_task_tab(self, tab):
+        # find_tab(active=True) borrows the active browser tab; it is never used.
+        # _task_tab and _select_task_tab require one owned tab and exact returned tabId.
+        await self._select_task_tab(tab)
+        await self.bridge.command('cdp',{'method':'Page.bringToFront','params':{}})
 
     def _page_issue(self, raw: dict[str, Any], observed_url: str) -> str | None:
         if not _is_official_url(observed_url):
@@ -656,6 +742,8 @@ class LocalPinduoduoAdapter:
             return {"_issue": "unexpected_redirect"}
         if "login" in urlsplit(snapshot["url"]).path.lower():
             return {"_issue": "login_required"}
+        if extractor == CONVERSATION_LIST_JS and urlsplit(snapshot['url']).path != '/chat_list.html':
+            return {'_issue':'unexpected_redirect'}
         if extractor==DETAIL_EXTRACT_JS:
             try:
                 if validate_product_input(snapshot['url'])!=validate_product_input(url):
@@ -665,7 +753,7 @@ class LocalPinduoduoAdapter:
         raw = decode_evaluation(await self.bridge.command("evaluate", {"code": extractor}))
         if extractor==DETAIL_EXTRACT_JS and raw.get('observed_goods_id',validate_product_input(url))!=validate_product_input(url):
             return {'_issue':'unexpected_redirect'}
-        issue = self._page_issue(raw, str(raw.get("url", "")))
+        issue = self._page_issue(raw, str(raw.get("url", ""))) or raw.get('issue')
         raw["_reused_current_page"] = reused
         return {"_issue": issue} if issue else raw
 
@@ -678,9 +766,11 @@ class LocalPinduoduoAdapter:
         self._last_business_navigation = now
         return None
 
-    async def search(self, keyword: str, limit: int = 5):
+    async def search(self, keyword: str, limit: int = 5, sort: str = "default", page: int = 1):
         if (not isinstance(keyword, str) or not 1 <= len(keyword.strip()) <= 100
-                or isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10):
+                or isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10
+                or not isinstance(sort,str) or sort not in {"default", "price_asc", "price_desc"}
+                or isinstance(page,bool) or not isinstance(page,int) or page < 1):
             return self._error("invalid_input")
         keyword = keyword.strip()
         async with self._lock:
@@ -704,7 +794,25 @@ class LocalPinduoduoAdapter:
                     return self._error("parse_error")
                 # Authentication was checked explicitly; generic OG branding is not an auth gate.
                 raw["ogTitle"] = ""
-                result = UPSTREAM["_process_search_result"](PARSER_CONTEXT, raw, keyword, limit)
+                result = UPSTREAM["_process_search_result"](PARSER_CONTEXT, raw, keyword, len(raw["items"]))
+                if sort != "default":
+                    def price_key(item):
+                        price = item.get("price")
+                        known = isinstance(price, (int, float)) and not isinstance(price, bool) and math.isfinite(price) and price >= 0
+                        return (not known, price if known and sort == "price_asc" else -price if known else 0)
+                    result["items"].sort(key=price_key)
+                loaded_count = len(result['items'])
+                start = (page - 1) * limit
+                if page > 1 and start >= loaded_count:
+                    data = {'platform':'pinduoduo','page':page,'page_scope':'loaded_only',
+                            'loaded_count':loaded_count,'reason':'outside_loaded_results',
+                            'message':'当前网页未提供已知翻页机制；请求页超出本次真实已加载结果。'}
+                    return {**data,'ok':False,'status':'unsupported','error_code':'unsupported','data':data}
+                result["items"] = result["items"][start:start + limit]
+                result.update({'page':page,'page_scope':'loaded_only','loaded_count':loaded_count,
+                               'has_next_page':start + limit < loaded_count})
+                result["sort"] = sort
+                result["sort_scope"] = "platform_default" if sort == "default" else "page_local"
                 sources = {source["goodsId"]: source for source in reversed(raw["items"])}
                 for item in result["items"]:
                     # The pure parser constructs the official URL from this numeric ID.
@@ -731,6 +839,83 @@ class LocalPinduoduoAdapter:
                 return self._error(exc.code)
             except Exception:
                 return self._error("bridge_error")
+
+    async def favorite_list(self, page: int = 1):
+        if isinstance(page, bool) or not isinstance(page, int) or page < 1:
+            return self._error('invalid_input')
+        if self.watchlist.path.exists():
+            with self.watchlist.connect() as db:
+                exists = db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pdd_confirmed_favorites'").fetchone()
+                if exists:
+                    rows = db.execute('SELECT goods_id,url,confirmed_at FROM pdd_confirmed_favorites ORDER BY confirmed_at DESC,goods_id').fetchall()
+                    items = [{'goodsId':row['goods_id'],'url':row['url'],'confirmed_at':row['confirmed_at'],'favorited':True} for row in rows]
+                    return tool_result({'platform':'pinduoduo','items':items[(page-1)*20:page*20],
+                        'count':len(items[(page-1)*20:page*20]),'page':page,'has_next_page':page*20<len(items),
+                        'scope':'mcp_favorite_records','source':'mcp_confirmed_actions','platform_full_list':False,
+                        'message':'仅本MCP确认的收藏记录，不含App历史收藏。','state':'ok'})
+        data = {'platform':'pinduoduo', 'scope':'platform_native', 'page':page,
+                'error_code':'unsupported', 'reason':'observed_app_required',
+                'evidence':{'date':'2026-10-08','requested_path':'/goods_collection.html',
+                            'observed_path':'/portal.html','app_prompt':True},
+                'alternative':'watchlist_list', 'alternative_scope':'mcp_local_watchlist',
+                'message':'当前已观察收藏入口重定向并要求在拼多多App打开；请本人在App查看原生收藏。本地watchlist不是平台收藏同步。'}
+        return {**data, 'ok':False, 'status':'unsupported', 'data':data}
+
+    def _record_favorite(self, goods_id: str, url: str, wanted: bool):
+        with self.watchlist.connect() as db:
+            db.execute('CREATE TABLE IF NOT EXISTS pdd_confirmed_favorites(goods_id TEXT PRIMARY KEY,url TEXT NOT NULL,confirmed_at REAL NOT NULL)')
+            if wanted:
+                db.execute('INSERT OR REPLACE INTO pdd_confirmed_favorites VALUES(?,?,?)',(goods_id,url,time.time()))
+            else:
+                db.execute('DELETE FROM pdd_confirmed_favorites WHERE goods_id=?',(goods_id,))
+
+    def _favorite_result(self, goods_id: str, url: str, wanted: bool, changed: bool, already: bool = False):
+        output = tool_result({'platform':'pinduoduo','goodsId':goods_id,'state':'ok','favorited':wanted,
+                              'changed':changed,'already':already,'url':url}, {'favorite':'ok'})
+        try:
+            self._record_favorite(goods_id,url,wanted)
+            output['local_record'] = 'confirmed'
+        except Exception:
+            output['local_record'] = 'unavailable'
+        return output
+
+    async def conversation_list(self):
+        async with self._lock:
+            if self._risk_blocked:
+                return self._error('risk_control')
+            cooldown = self._navigation_cooldown()
+            if cooldown:
+                return cooldown
+            try:
+                raw = await self._read('https://mobile.yangkeduo.com/chat_list.html', CONVERSATION_LIST_JS)
+                if '_issue' in raw:
+                    return self._error(raw['_issue'])
+                rows = raw.get('conversations')
+                if not isinstance(rows,list) or (not rows and raw.get('empty') is not True):
+                    return self._error('parse_error')
+                conversations = []
+                for row in rows[:50]:
+                    if not isinstance(row,dict) or not isinstance(row.get('name'),str) or not row['name'].strip():
+                        continue
+                    unread = row.get('unread')
+                    goods_id = row.get('goodsId')
+                    product_url = canonical_product_url(goods_id) if isinstance(goods_id,str) and re.fullmatch(r'[0-9]{1,20}',goods_id) else None
+                    conversations.append({'name':redact_text(row['name']),
+                        'last_time':redact_text(row['last_time'],80) if row.get('last_time') else None,
+                        'last_message':redact_text(row['last_message'],160) if row.get('last_message') else None,
+                        'unread':unread if isinstance(unread,int) and not isinstance(unread,bool) and unread >= 0 else None,
+                        'source':'visible_msg_box', 'product_url':product_url, 'conversation_url':None,
+                        'locator_status':'available' if product_url else 'missing'})
+                if rows and not conversations:
+                    return self._error('parse_error')
+                return tool_result({'platform':'pinduoduo','conversations':conversations,
+                                    'count':len(conversations),'scope':'platform_visible_page',
+                                    'locator_status':'available' if all(row['product_url'] for row in conversations) else 'partial',
+                                    'state':'ok'})
+            except BridgeError as exc:
+                return self._error(exc.code)
+            except Exception:
+                return self._error('bridge_error')
 
     async def product(self, url_or_id: str):
         try:
@@ -849,7 +1034,7 @@ class LocalPinduoduoAdapter:
                     tab = await self._task_tab()
                 if not tab:
                     return self._error("unexpected_redirect")
-                async def inspect(phase, click=False):
+                async def inspect(phase, click=False, allow_loading=False):
                     current=await self._task_tab()
                     if not current: raise BridgeError('unexpected_redirect')
                     current_path=urlsplit(str(current.get('url',''))).path.lower()
@@ -859,9 +1044,13 @@ class LocalPinduoduoAdapter:
                     else:
                         values=parse_qs(urlsplit(str(current.get('url',''))).query,keep_blank_values=True)
                         if current_path!='/chat_detail.html' or values.get('goods_id')!=[goods_id] or not expected_mall or values.get('mall_sn')!=[expected_mall]: raise BridgeError('unexpected_redirect')
-                    await self._select_task_tab(current)
+                    await self._front_task_tab(current)
                     raw=decode_evaluation(await self.bridge.command('evaluate',{'code':merchant_script(goods_id,phase,(text or '') if phase in {'draft','send'} else '',click,expected_mall if phase!='entry' else '')}))
-                    issue=self._page_issue(raw,str(raw.get('url',''))) or raw.get('issue')
+                    issue=self._page_issue(raw,str(raw.get('url','')))
+                    if issue: raise BridgeError(issue)
+                    if allow_loading and phase=='read' and raw.get('conversation_loading') is True and raw.get('issue')=='ambiguous_control' and raw.get('goodsId')==goods_id:
+                        return raw
+                    issue=raw.get('issue')
                     if issue: raise BridgeError(issue if issue in ERROR_MESSAGES else 'parse_error')
                     if raw.get('goodsId')!=goods_id: raise BridgeError('unexpected_redirect')
                     return raw
@@ -876,7 +1065,16 @@ class LocalPinduoduoAdapter:
                     expected_mall=values['mall_sn'][0]
                     with self.watchlist.connect() as db:
                         db.execute('INSERT OR REPLACE INTO merchant_bindings VALUES(?,?)',(goods_id,expected_mall))
-                before=await inspect('read')
+                async def read_ready():
+                    deadline = time.monotonic() + 8
+                    while True:
+                        observed = await inspect('read',allow_loading=True)
+                        if observed.get('conversation_loading') is not True:
+                            return observed
+                        if time.monotonic() >= deadline:
+                            raise BridgeError('ambiguous_control')
+                        await asyncio.sleep(0.25)
+                before=await read_ready()
                 messages=[{'text':redact_text(m.get('text',''),1000)} for m in before.get('messages',[]) if isinstance(m,dict)]
                 if text is None:
                     return tool_result({'platform':'pinduoduo','goodsId':goods_id,'url':canonical,'messages':messages,'merchant_identity_verified':True,'state':'ok'})
@@ -920,12 +1118,18 @@ class LocalPinduoduoAdapter:
                 raw = await self._read(url, DETAIL_EXTRACT_JS, reuse_product_page=True)
                 if "_issue" in raw:
                     return self._error(raw["_issue"])
+                if raw.get('appRequired') is True:
+                    return self._app_favorite_unsupported()
                 async def inspect(click=False):
                     tab = await self._task_tab()
                     if tab is None or validate_product_input(tab.get("url", "")) != goods_id:
                         raise BridgeError("unexpected_redirect")
-                    await self._select_task_tab(tab)
+                    await self._front_task_tab(tab)
                     state = decode_evaluation(await self.bridge.command("evaluate", {"code": favorite_script(goods_id, wanted, click)}))
+                    if state.get('appRequired') is True:
+                        error = BridgeError('unsupported')
+                        error.app_required = True
+                        raise error
                     issue = self._page_issue(state, str(state.get("url", "")))
                     if issue:
                         raise BridgeError(issue)
@@ -934,27 +1138,35 @@ class LocalPinduoduoAdapter:
                     return state
                 before = await inspect()
                 if before.get("confirmed") is True:
-                    return tool_result({"platform": "pinduoduo", "goodsId": goods_id, "state": "ok", "favorited": wanted,
-                                   "changed": False, "already": True, "url": url}, {"favorite": "ok"})
+                    return self._favorite_result(goods_id,url,wanted,False,True)
                 clicked = await inspect(click=True)
                 # Only passive observation after one click; never repeat a write.
                 tab = await self._task_tab()
                 if tab and re.search(r"checkout|order|payment|cashier|pay\.html", urlsplit(str(tab.get("url", ""))).path, re.I):
                     return self._error("checkout_page_reached")
                 try:
+                    await asyncio.sleep(0.15)
                     after = await inspect()
+                    if after.get('confirmed') is not True:
+                        # Two bounded passive observations accommodate the native async label flip.
+                        # There is still exactly one click and no navigation or write retry.
+                        await asyncio.sleep(0.4)
+                        after = await inspect()
                 except BridgeError as exc:
+                    if getattr(exc,'app_required',False):
+                        return self._app_favorite_unsupported()
                     if exc.code not in {"unsupported", "ambiguous_control", "unsafe_control", "bridge_error", "parse_error", "bridge_unavailable"}:
                         raise
                     after = {}
                 if after.get("confirmed") is True:
-                    return tool_result({"platform": "pinduoduo", "goodsId": goods_id, "state": "ok", "favorited": wanted,
-                                   "changed": clicked.get("clicked") is True, "url": url}, {"favorite": "ok"})
+                    return self._favorite_result(goods_id,url,wanted,clicked.get('clicked') is True)
                 output = self._error("action_unconfirmed")
                 output.update({"status": "unverified", "clicked": clicked.get("clicked") is True})
                 output["data"]["clicked"] = clicked.get("clicked") is True
                 return output
             except BridgeError as exc:
+                if getattr(exc,'app_required',False):
+                    return self._app_favorite_unsupported()
                 return self._error(exc.code)
             except ValueError:
                 return self._error("unexpected_redirect")
@@ -1018,15 +1230,27 @@ async def status_pinduoduo() -> dict[str, Any]:
 
 
 @mcp.tool()
-async def search_pinduoduo(keyword: str, limit: int = 5) -> dict[str, Any]:
-    """只读搜索拼多多商品，limit 1–10；普通页面不支持或风控时如实停止。"""
-    return await adapter.search(keyword, limit)
+async def search_pinduoduo(keyword: str, limit: int = 5, sort: str = "default", page: int = 1) -> dict[str, Any]:
+    """只读搜索，limit 1–10；page只在真实已加载结果切片，sort为default/price_asc/price_desc（本页）。"""
+    return await adapter.search(keyword, limit, sort, page)
 
 
 @mcp.tool()
 async def get_pinduoduo_product(url_or_id: str) -> dict[str, Any]:
     """读取一件拼多多商品；仅接受官方商品 URL 或数字 goods_id。"""
     return await adapter.product(url_or_id)
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True})
+async def favorite_list(page: int = 1) -> dict[str, Any]:
+    """本MCP真实确认的收藏记录，不含App历史；尚无确认记录表时返回原生收藏入口App边界。"""
+    return await adapter.favorite_list(page)
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True})
+async def conversation_list() -> dict[str, Any]:
+    """只读官方聊天首页可见会话：对象名、时间、末条摘要、已露出的未读数；不打开或发送会话。"""
+    return await adapter.conversation_list()
 
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True})

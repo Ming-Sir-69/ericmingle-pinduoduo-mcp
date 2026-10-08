@@ -272,3 +272,49 @@ def test_favorite_sibling_buy_button_is_separate_but_interactive_ancestor_is_che
     assert run_favorite_fixture({"labels": ["收藏"], "sibling": True})["clicks"] == 1
     assert run_favorite_fixture({"labels": ["收藏"], "parent": "立即购买", "parentNested": True, "parentInteractive": True})["clicks"] == 0
     assert run_favorite_fixture({"labels": ["收藏"], "parent": "普通容器", "parentHref": "/checkout"})["clicks"] == 0
+
+
+
+@pytest.mark.asyncio
+async def test_delayed_native_state_is_read_back_without_second_click_and_records(tmp_path):
+    class DelayedBridge(ActionBridge):
+        def __init__(self):
+            super().__init__(confirmed=True)
+            self.reads_after_click = 0
+        async def command(self, action, args=None):
+            raw = await super().command(action,args)
+            if action == 'evaluate' and adapter_module().is_favorite_script(args['code']) and '"click":false' in args['code'] and self.action_clicks:
+                self.reads_after_click += 1
+                if self.reads_after_click == 1:
+                    value = json.loads(raw['value']);value['confirmed']=False;raw['value']=json.dumps(value)
+            return raw
+    bridge = DelayedBridge()
+    api = adapter_module().LocalPinduoduoAdapter(tmp_path, bridge=bridge)
+    result = await api.favorite('123')
+    assert result['ok'] is True and bridge.action_clicks == 1
+    assert (await api.favorite_list())['items'][0]['goodsId'] == '123'
+
+
+def test_bring_to_front_contract_never_borrows_or_accepts_other_cdp():
+    module=adapter_module()
+    module.BridgeClient._validate_command('cdp',{'method':'Page.bringToFront','params':{}})
+    for action,args in [('find_tab',{'url':'https://mobile.yangkeduo.com/goods2.html?goods_id=123','active':True}),
+        ('cdp',{'method':'Network.getCookies','params':{}}),
+        ('cdp',{'method':'Page.bringToFront','params':{'targetId':'other'}})]:
+        with pytest.raises(ValueError):module.BridgeClient._validate_command(action,args)
+
+
+@pytest.mark.asyncio
+async def test_explicit_favorite_fronts_only_checked_owned_page(tmp_path):
+    class FrontBridge(ActionBridge):
+        async def command(self,action,args=None):
+            if action=='cdp':
+                self.calls.append((action,args));return {'success':True}
+            return await super().command(action,args)
+    bridge=FrontBridge(confirmed=True)
+    result=await adapter_module().LocalPinduoduoAdapter(tmp_path,bridge=bridge).favorite('123')
+    assert result['ok'] is True
+    cdps=[x for x in bridge.calls if x[0]=='cdp']
+    assert cdps and all(args=={'method':'Page.bringToFront','params':{}} for _,args in cdps)
+    for index,(action,args) in enumerate(bridge.calls):
+        if action=='cdp':assert bridge.calls[index-1][0]=='find_tab' and bridge.calls[index-1][1]['active'] is False

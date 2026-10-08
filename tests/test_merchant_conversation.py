@@ -103,3 +103,36 @@ const result=JSON.parse(eval(require('fs').readFileSync(0,'utf8')));console.log(
     except TypeError: pytest.fail('conversation send script not implemented')
     out=subprocess.run([shutil.which('node'),'-e',runner,json.dumps(labels)],input=code,text=True,capture_output=True,check=True)
     assert json.loads(out.stdout)['clicks']==int(expected)
+
+
+@pytest.mark.asyncio
+async def test_loading_message_container_is_passively_read_again_without_entry_or_send_retry(tmp_path):
+    class LoadingBridge(ChatBridge):
+        def __init__(self):
+            super().__init__()
+            self.reads = 0
+        async def command(self,action,args=None):
+            value=await super().command(action,args)
+            if action=='evaluate' and '"phase":"read"' in (args or {}).get('code',''):
+                self.reads += 1
+                if self.reads==1:
+                    value={'value':json.dumps({'url':CHAT,'goodsId':'123','issue':'ambiguous_control','conversation_loading':True})}
+            return value
+    bridge=LoadingBridge()
+    out=await adapter_module().LocalPinduoduoAdapter(tmp_path,bridge=bridge).merchant_messages(URL)
+    assert out['ok'] is True and bridge.reads==2 and bridge.sends==0
+    clicks=[args for action,args in bridge.calls if action=='evaluate' and '"phase":"entry"' in args['code'] and '"click":true' in args['code']]
+    assert len(clicks)==1
+
+
+@pytest.mark.asyncio
+async def test_duplicate_message_container_is_not_treated_as_loading(tmp_path):
+    class AmbiguousBridge(ChatBridge):
+        async def command(self,action,args=None):
+            value=await super().command(action,args)
+            if action=='evaluate' and '"phase":"read"' in (args or {}).get('code',''):
+                return {'value':json.dumps({'url':CHAT,'goodsId':'123','issue':'ambiguous_control','conversation_loading':False})}
+            return value
+    bridge=AmbiguousBridge()
+    out=await adapter_module().LocalPinduoduoAdapter(tmp_path,bridge=bridge).merchant_messages(URL)
+    assert out['error_code']=='ambiguous_control' and bridge.sends==0
